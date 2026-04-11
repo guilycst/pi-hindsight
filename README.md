@@ -28,8 +28,7 @@ To bridge this gap, we've included three manual tools directly into this extensi
 ## Setup
 1. Install this extension:
    ```bash
-   npm install -g path/to/hindsight-selfhosted
-   pi install path/to/hindsight-selfhosted
+   pi install git:github.com/anh-chu/pi-hindsight
    ```
 
 2. Configure your Hindsight server credentials in `~/.hindsight/config`:
