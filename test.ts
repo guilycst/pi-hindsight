@@ -890,23 +890,23 @@ describe("configureBankMission", () => {
     mission: string,
     fetchImpl: any
   ): Promise<void> {
-    const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/config`, {
-      method: "PATCH",
+    const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}`, {
+      method: "PUT",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.api_key || ""}` },
-      body: JSON.stringify({ retain_mission: mission }),
+      body: JSON.stringify({ mission }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   }
 
-  test("calls PATCH /config with retain_mission", async () => {
+  test("calls PUT /banks/{bank} with mission field", async () => {
     const fetchMock = mock.fn(async () => ({ ok: true, status: 200 }));
     const config = { api_url: "http://localhost:8888", api_key: "k" };
     await configureBankMission(config, "project-myapp", "A React e-commerce app", fetchMock);
     assert.equal(fetchMock.mock.calls.length, 1);
     const [url, opts] = fetchMock.mock.calls[0].arguments;
-    assert.ok(url.includes("/v1/default/banks/project-myapp/config"));
-    assert.equal(opts.method, "PATCH");
-    assert.equal(JSON.parse(opts.body).retain_mission, "A React e-commerce app");
+    assert.ok(url.endsWith("/v1/default/banks/project-myapp"), `unexpected url: ${url}`);
+    assert.equal(opts.method, "PUT");
+    assert.equal(JSON.parse(opts.body).mission, "A React e-commerce app");
   });
 
   test("throws on non-ok response", async () => {
@@ -928,12 +928,12 @@ describe("getBankMission", () => {
     fetchImpl: any
   ): Promise<string | null> {
     try {
-      const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/config`, {
+      const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/profile`, {
         headers: { "Authorization": `Bearer ${config.api_key || ""}` },
       });
       if (!res.ok) return null;
       const data = await res.json();
-      return data.overrides?.retain_mission || data.config?.retain_mission || null;
+      return data.mission || null;
     } catch (_) {
       return null;
     }
@@ -941,22 +941,24 @@ describe("getBankMission", () => {
 
   const config = { api_url: "http://localhost:8888", api_key: "k" };
 
-  test("returns overrides.retain_mission when set", async () => {
+  test("returns mission field from profile", async () => {
     const fetchMock = mock.fn(async () => ({
       ok: true,
-      json: async () => ({ overrides: { retain_mission: "custom mission" }, config: { retain_mission: "default" } }),
+      json: async () => ({ mission: "custom mission" }),
     }));
     const result = await getBankMission(config, "project-myapp", fetchMock);
-    assert.equal(result, "custom mission", "should prefer overrides");
+    assert.equal(result, "custom mission");
+    const url: string = fetchMock.mock.calls[0].arguments[0];
+    assert.ok(url.endsWith("/v1/default/banks/project-myapp/profile"), `unexpected url: ${url}`);
   });
 
-  test("falls back to config.retain_mission when no override", async () => {
+  test("returns null when mission not set in profile", async () => {
     const fetchMock = mock.fn(async () => ({
       ok: true,
-      json: async () => ({ overrides: {}, config: { retain_mission: "server default" } }),
+      json: async () => ({}),
     }));
     const result = await getBankMission(config, "project-myapp", fetchMock);
-    assert.equal(result, "server default");
+    assert.equal(result, null);
   });
 
   test("returns null when no mission set anywhere", async () => {
@@ -1090,10 +1092,10 @@ describe("session_start mission message", () => {
     const messages: any[] = [];
     const mockPi = { sendMessage: (msg: any) => messages.push(msg) };
     try {
-      const res = await opts.fetchImpl(`${opts.config.api_url}/v1/default/banks/${opts.bank}/config`, {
-        method: "PATCH",
+      const res = await opts.fetchImpl(`${opts.config.api_url}/v1/default/banks/${opts.bank}`, {
+        method: "PUT",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${opts.config.api_key || ""}` },
-        body: JSON.stringify({ retain_mission: opts.mission }),
+        body: JSON.stringify({ mission: opts.mission }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       mockPi.sendMessage({ customType: "hindsight-mission", content: "", display: true, details: { bank: opts.bank, mission: opts.mission } });
@@ -1150,14 +1152,13 @@ describe("checkBankConfig", () => {
     fetchImpl: any
   ): Promise<{ ok: true; mission: string | null } | { ok: false; authError: boolean }> {
     try {
-      const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/config`, {
+      const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/profile`, {
         headers: { "Authorization": `Bearer ${config.api_key || ""}` },
       });
       if (res.status === 401 || res.status === 403) return { ok: false, authError: true };
       if (!res.ok) return { ok: false, authError: false };
       const data = await res.json();
-      const mission = data.overrides?.retain_mission || data.config?.retain_mission || null;
-      return { ok: true, mission };
+      return { ok: true, mission: data.mission || null };
     } catch (_) {
       return { ok: false, authError: false };
     }
@@ -1165,20 +1166,22 @@ describe("checkBankConfig", () => {
 
   const config = { api_url: "http://localhost:8888", api_key: "k" };
 
-  test("returns ok:true with mission when bank configured", async () => {
+  test("returns ok:true with mission from profile", async () => {
     const fetchMock = mock.fn(async () => ({
       ok: true, status: 200,
-      json: async () => ({ overrides: { retain_mission: "A cool project" }, config: {} }),
+      json: async () => ({ mission: "A cool project" }),
     }));
     const result = await checkBankConfig(config, "project-myapp", fetchMock);
     assert.equal(result.ok, true);
     assert.equal((result as any).mission, "A cool project");
+    const url: string = fetchMock.mock.calls[0].arguments[0];
+    assert.ok(url.endsWith("/profile"), `expected /profile, got: ${url}`);
   });
 
   test("returns ok:true with null mission when none set", async () => {
     const fetchMock = mock.fn(async () => ({
       ok: true, status: 200,
-      json: async () => ({ overrides: {}, config: {} }),
+      json: async () => ({})
     }));
     const result = await checkBankConfig(config, "project-myapp", fetchMock);
     assert.equal(result.ok, true);

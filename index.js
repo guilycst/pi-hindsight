@@ -101,26 +101,26 @@ function inferProjectMission() {
     return basename(process.cwd());
 }
 async function configureBankMission(config, bank, mission) {
-    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
-        method: "PATCH",
+    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}`, {
+        method: "PUT",
         headers: {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${config.api_key || ""}`
         },
-        body: JSON.stringify({ retain_mission: mission })
+        body: JSON.stringify({ mission })
     });
     if (!res.ok)
         throw new Error(`HTTP ${res.status}`);
 }
 async function getBankMission(config, bank) {
     try {
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
+        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/profile`, {
             headers: { "Authorization": `Bearer ${config.api_key || ""}` }
         });
         if (!res.ok)
             return null;
         const data = await res.json();
-        return data.overrides?.retain_mission || data.config?.retain_mission || null;
+        return data.mission || null;
     }
     catch (_) {
         return null;
@@ -128,7 +128,7 @@ async function getBankMission(config, bank) {
 }
 async function checkBankConfig(config, bank) {
     try {
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/config`, {
+        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/profile`, {
             headers: { "Authorization": `Bearer ${config.api_key || ""}` }
         });
         if (res.status === 401 || res.status === 403)
@@ -136,8 +136,7 @@ async function checkBankConfig(config, bank) {
         if (!res.ok)
             return { ok: false, authError: false };
         const data = await res.json();
-        const mission = data.overrides?.retain_mission || data.config?.retain_mission || null;
-        return { ok: true, mission };
+        return { ok: true, mission: data.mission || null };
     }
     catch (_) {
         return { ok: false, authError: false };
