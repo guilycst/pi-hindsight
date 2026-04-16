@@ -176,7 +176,7 @@ async function simulateRecall(opts: {
         {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.api_key || ""}` },
-          body: JSON.stringify({ query: opts.userPrompt, max_tokens: 1024 }),
+          body: JSON.stringify({ query: opts.userPrompt, budget: "mid", query_timestamp: new Date().toISOString() }),
         }
       );
       if (!res.ok) return [];
@@ -213,11 +213,11 @@ async function simulateRetain(opts: {
   projectBank: string;
   userPrompt: string;
   transcript: string;
+  sessionId?: string;
   fetchImpl: any;
-}): Promise<{ skipped: boolean; reason?: string; calledBanks: string[]; allFailed: boolean }> {
+}): Promise<{ skipped: boolean; reason?: string; calledBanks: string[]; allFailed: boolean; lastRequestBody?: any }> {
   const config = opts.config;
   if (!config || !config.api_url) return { skipped: true, reason: "no config", calledBanks: [], allFailed: false };
-
   const prompt = opts.userPrompt;
   if (!prompt) return { skipped: true, reason: "no prompt", calledBanks: [], allFailed: false };
   if (prompt.length < 5 || /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(prompt.trim())) {
@@ -226,30 +226,45 @@ async function simulateRetain(opts: {
   if (prompt.trim().startsWith("#nomem") || prompt.trim().startsWith("#skip")) {
     return { skipped: true, reason: "opt-out", calledBanks: [], allFailed: false };
   }
-
   const banks = new Set<string>();
   banks.add(opts.projectBank);
   if (config.global_bank && (prompt.includes("#global") || prompt.includes("#me"))) {
     banks.add(config.global_bank);
   }
-
   const calledBanks: string[] = [];
   const bankList = Array.from(banks);
-
+  const sessionId = opts.sessionId ?? "test-session";
+  let lastRequestBody: any;
   const results = await Promise.allSettled(
     bankList.map(async (bank) => {
+      const body = {
+        items: [{
+          content: opts.transcript,
+          document_id: `session-${sessionId}`,
+          update_mode: "append",
+          context: `pi coding session: ${prompt.slice(0, 100)}`,
+          timestamp: new Date().toISOString(),
+        }],
+        async: true,
+      };
+      lastRequestBody = body;
       const res = await opts.fetchImpl(`${config.api_url}/v1/default/banks/${bank}/memories`, {
         method: "POST",
-        body: JSON.stringify({ items: [{ content: opts.transcript }], async: true }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       calledBanks.push(bank);
       return bank;
     })
   );
-
-  const allFailed = results.every(r => r.status === "rejected");
-  return { skipped: false, calledBanks, allFailed };
+  const succeededBanks = results
+    .filter(r => r.status === "fulfilled")
+    .map(r => (r as PromiseFulfilledResult<string>).value);
+  const allFailed = succeededBanks.length === 0;
+  const sentMessage = allFailed
+    ? { customType: "hindsight-retain-failed", display: true, details: {} }
+    : { customType: "hindsight-retain", display: true, details: { banks: succeededBanks } };
+  return { skipped: false, calledBanks, allFailed, lastRequestBody, sentMessage };
 }
 
 // ---------------------------------------------------------------------------
@@ -630,5 +645,687 @@ describe("recallDone lifecycle reset", () => {
     // fetch should only have been called once total (2 banks in first call = 1 here since no global)
     assert.equal(fetchMock.mock.calls.length, 1, "fetch only called on first turn");
     assert.equal(r2.injectedContent, null, "second turn should not inject");
+  });
+});
+
+// ─── New field tests ─────────────────────────────────────────────────────────
+
+describe("Recall request shape", () => {
+  const config = { api_url: "http://localhost:8888", api_key: "k", global_bank: "global" };
+
+  test("uses budget:mid instead of max_tokens", async () => {
+    const fetchMock = mockFetchOk([{ text: "memory" }]);
+    await simulateRecall({
+      config,
+      projectBank: "project-test",
+      userPrompt: "how does auth work?",
+      fetchImpl: fetchMock,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0].arguments[1].body);
+    assert.equal(body.budget, "mid");
+    assert.equal(body.max_tokens, undefined, "max_tokens should not be sent");
+  });
+
+  test("sends query_timestamp as ISO string", async () => {
+    const before = Date.now();
+    const fetchMock = mockFetchOk([]);
+    await simulateRecall({
+      config,
+      projectBank: "project-test",
+      userPrompt: "what did we decide?",
+      fetchImpl: fetchMock,
+    });
+    const after = Date.now();
+    const body = JSON.parse(fetchMock.mock.calls[0].arguments[1].body);
+    assert.ok(body.query_timestamp, "query_timestamp must be present");
+    const ts = new Date(body.query_timestamp).getTime();
+    assert.ok(ts >= before && ts <= after, "query_timestamp should be recent");
+  });
+});
+
+describe("Retain request shape", () => {
+  const config = { api_url: "http://localhost:8888", api_key: "k", global_bank: "global" };
+
+  test("sets document_id to session-{sessionId}", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "refactor the auth module",
+      transcript: "user: refactor\nassistant: done",
+      sessionId: "abc123",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.skipped, false);
+    assert.equal(result.lastRequestBody.items[0].document_id, "session-abc123");
+  });
+
+  test("sets update_mode to append", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "add logging to all routes",
+      transcript: "user: add logging\nassistant: done",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.lastRequestBody.items[0].update_mode, "append");
+  });
+
+  test("context starts with 'pi coding session:' and includes prompt snippet", async () => {
+    const fetchMock = mockFetchOk();
+    const prompt = "how do I add a middleware?";
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: prompt,
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    const context: string = result.lastRequestBody.items[0].context;
+    assert.ok(context.startsWith("pi coding session:"), `context should start with label, got: ${context}`);
+    assert.ok(context.includes(prompt.slice(0, 20)), "context should include prompt snippet");
+  });
+
+  test("context truncates long prompts to 100 chars", async () => {
+    const fetchMock = mockFetchOk();
+    const longPrompt = "a".repeat(200) + " end";
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: longPrompt,
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    const context: string = result.lastRequestBody.items[0].context;
+    assert.ok(!context.includes(" end"), "context should not include chars past 100");
+  });
+
+  test("timestamp is a recent ISO string", async () => {
+    const before = Date.now();
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "show me the build config",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    const after = Date.now();
+    const ts = new Date(result.lastRequestBody.items[0].timestamp).getTime();
+    assert.ok(ts >= before && ts <= after, "timestamp should be recent");
+  });
+});
+
+describe("Retain next-turn messages", () => {
+  const config = { api_url: "http://localhost:8888", api_key: "k", global_bank: "global" };
+
+  test("success: sends hindsight-retain message with display:true and bank list", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "refactor the auth module",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.skipped, false);
+    assert.equal(result.sentMessage?.customType, "hindsight-retain");
+    assert.equal(result.sentMessage?.display, true);
+    assert.ok(
+      (result.sentMessage?.details as any)?.banks?.includes("project-test"),
+      "details.banks should include project bank"
+    );
+  });
+
+  test("failure: sends hindsight-retain-failed message with display:true", async () => {
+    const fetchMock = mockFetchFail(503);
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "refactor the auth module",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.allFailed, true);
+    assert.equal(result.sentMessage?.customType, "hindsight-retain-failed");
+    assert.equal(result.sentMessage?.display, true);
+  });
+
+  test("success with #global: banks list includes global bank", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "remember this pattern #global",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    const banks: string[] = (result.sentMessage?.details as any)?.banks ?? [];
+    assert.ok(banks.includes("project-test"), "should include project bank");
+    assert.ok(banks.includes("global"), "should include global bank");
+  });
+
+  test("skipped retain: no message sent", async () => {
+    const fetchMock = mockFetchOk();
+    const result = await simulateRetain({
+      config,
+      projectBank: "project-test",
+      userPrompt: "ok",
+      transcript: "...",
+      fetchImpl: fetchMock,
+    });
+    assert.equal(result.skipped, true);
+    assert.equal(result.sentMessage, undefined);
+  });
+});
+
+// ─── inferProjectMission tests ────────────────────────────────────────────────
+
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin, basename as pathBasename } from "node:path";
+
+describe("inferProjectMission", () => {
+  function inferProjectMission(cwd: string): string {
+    try {
+      const pkgPath = pathJoin(cwd, "package.json");
+      if (existsSync(pkgPath)) {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+        if (pkg.description) return pkg.description;
+      }
+    } catch (_) {}
+    try {
+      const readmePath = pathJoin(cwd, "README.md");
+      if (existsSync(readmePath)) {
+        const content = readFileSync(readmePath, "utf-8").slice(0, 400).trim();
+        if (content) return content;
+      }
+    } catch (_) {}
+    return pathBasename(cwd);
+  }
+
+  test("returns package.json description when present", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-test-"));
+    try {
+      writeFileSync(pathJoin(dir, "package.json"), JSON.stringify({ description: "My cool project" }));
+      assert.equal(inferProjectMission(dir), "My cool project");
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("falls back to README.md when package.json has no description", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-test-"));
+    try {
+      writeFileSync(pathJoin(dir, "package.json"), JSON.stringify({ name: "my-app" }));
+      writeFileSync(pathJoin(dir, "README.md"), "# My App\nThis does cool things.");
+      const result = inferProjectMission(dir);
+      assert.ok(result.includes("My App"), `expected README content, got: ${result}`);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("falls back to directory name when no package.json or README", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-test-myproject-"));
+    try {
+      const result = inferProjectMission(dir);
+      assert.equal(result, pathBasename(dir));
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("truncates README to 400 chars", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-test-"));
+    try {
+      writeFileSync(pathJoin(dir, "README.md"), "x".repeat(1000));
+      const result = inferProjectMission(dir);
+      assert.ok(result.length <= 400, `expected ≤400 chars, got ${result.length}`);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+});
+
+// ─── configureBankMission tests ───────────────────────────────────────────────
+
+describe("configureBankMission", () => {
+  async function configureBankMission(
+    config: { api_url: string; api_key?: string },
+    bank: string,
+    mission: string,
+    fetchImpl: any
+  ): Promise<void> {
+    const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/config`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.api_key || ""}` },
+      body: JSON.stringify({ retain_mission: mission }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  }
+
+  test("calls PATCH /config with retain_mission", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: true, status: 200 }));
+    const config = { api_url: "http://localhost:8888", api_key: "k" };
+    await configureBankMission(config, "project-myapp", "A React e-commerce app", fetchMock);
+    assert.equal(fetchMock.mock.calls.length, 1);
+    const [url, opts] = fetchMock.mock.calls[0].arguments;
+    assert.ok(url.includes("/v1/default/banks/project-myapp/config"));
+    assert.equal(opts.method, "PATCH");
+    assert.equal(JSON.parse(opts.body).retain_mission, "A React e-commerce app");
+  });
+
+  test("throws on non-ok response", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 500 }));
+    const config = { api_url: "http://localhost:8888", api_key: "k" };
+    await assert.rejects(
+      () => configureBankMission(config, "project-myapp", "mission", fetchMock),
+      /HTTP 500/
+    );
+  });
+});
+
+// ─── getBankMission tests ─────────────────────────────────────────────────────
+
+describe("getBankMission", () => {
+  async function getBankMission(
+    config: { api_url: string; api_key?: string },
+    bank: string,
+    fetchImpl: any
+  ): Promise<string | null> {
+    try {
+      const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/config`, {
+        headers: { "Authorization": `Bearer ${config.api_key || ""}` },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.overrides?.retain_mission || data.config?.retain_mission || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  const config = { api_url: "http://localhost:8888", api_key: "k" };
+
+  test("returns overrides.retain_mission when set", async () => {
+    const fetchMock = mock.fn(async () => ({
+      ok: true,
+      json: async () => ({ overrides: { retain_mission: "custom mission" }, config: { retain_mission: "default" } }),
+    }));
+    const result = await getBankMission(config, "project-myapp", fetchMock);
+    assert.equal(result, "custom mission", "should prefer overrides");
+  });
+
+  test("falls back to config.retain_mission when no override", async () => {
+    const fetchMock = mock.fn(async () => ({
+      ok: true,
+      json: async () => ({ overrides: {}, config: { retain_mission: "server default" } }),
+    }));
+    const result = await getBankMission(config, "project-myapp", fetchMock);
+    assert.equal(result, "server default");
+  });
+
+  test("returns null when no mission set anywhere", async () => {
+    const fetchMock = mock.fn(async () => ({
+      ok: true,
+      json: async () => ({ overrides: {}, config: {} }),
+    }));
+    const result = await getBankMission(config, "project-myapp", fetchMock);
+    assert.equal(result, null);
+  });
+
+  test("returns null on HTTP error", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 404 }));
+    const result = await getBankMission(config, "project-myapp", fetchMock);
+    assert.equal(result, null);
+  });
+
+  test("returns null on network error", async () => {
+    const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const result = await getBankMission(config, "project-myapp", fetchMock);
+    assert.equal(result, null);
+  });
+});
+
+// ─── getServerHealth tests ────────────────────────────────────────────────────
+
+describe("getServerHealth", () => {
+  async function getServerHealth(
+    config: { api_url: string; api_key?: string },
+    fetchImpl: any
+  ): Promise<{ ok: boolean; status?: number }> {
+    try {
+      const res = await fetchImpl(`${config.api_url}/health`, {
+        headers: { "Authorization": `Bearer ${config.api_key || ""}` },
+      });
+      return { ok: res.ok, status: res.status };
+    } catch (_) {
+      return { ok: false };
+    }
+  }
+
+  const config = { api_url: "http://localhost:8888", api_key: "k" };
+
+  test("returns ok:true when server healthy", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: true, status: 200 }));
+    const result = await getServerHealth(config, fetchMock);
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 200);
+  });
+
+  test("returns ok:false with status on HTTP error", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 503 }));
+    const result = await getServerHealth(config, fetchMock);
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 503);
+  });
+
+  test("returns ok:false with no status on network error", async () => {
+    const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const result = await getServerHealth(config, fetchMock);
+    assert.equal(result.ok, false);
+    assert.equal(result.status, undefined);
+  });
+
+  test("calls /health endpoint", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: true, status: 200 }));
+    await getServerHealth(config, fetchMock);
+    const url: string = fetchMock.mock.calls[0].arguments[0];
+    assert.ok(url.endsWith("/health"), `expected /health, got: ${url}`);
+  });
+});
+
+// ─── getBankStats tests ────────────────────────────────────────────────────────
+
+describe("getBankStats", () => {
+  async function getBankStats(
+    config: { api_url: string; api_key?: string },
+    bank: string,
+    fetchImpl: any
+  ): Promise<Record<string, number> | null> {
+    try {
+      const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/stats`, {
+        headers: { "Authorization": `Bearer ${config.api_key || ""}` },
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  const config = { api_url: "http://localhost:8888", api_key: "k" };
+
+  test("returns stats object on success", async () => {
+    const stats = { memories_count: 42, entities_count: 7, documents_count: 3 };
+    const fetchMock = mock.fn(async () => ({ ok: true, json: async () => stats }));
+    const result = await getBankStats(config, "project-myapp", fetchMock);
+    assert.deepEqual(result, stats);
+  });
+
+  test("calls correct stats endpoint", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: true, json: async () => ({}) }));
+    await getBankStats(config, "project-myapp", fetchMock);
+    const url: string = fetchMock.mock.calls[0].arguments[0];
+    assert.ok(url.includes("/v1/default/banks/project-myapp/stats"), `unexpected url: ${url}`);
+  });
+
+  test("returns null on HTTP error", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 404 }));
+    const result = await getBankStats(config, "project-myapp", fetchMock);
+    assert.equal(result, null);
+  });
+
+  test("returns null on network error", async () => {
+    const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const result = await getBankStats(config, "project-myapp", fetchMock);
+    assert.equal(result, null);
+  });
+});
+
+// ─── session_start mission message tests ────────────────────────────────────
+
+describe("session_start mission message", () => {
+  async function simulateSessionStartMission(opts: {
+    config: { api_url: string; api_key?: string } | null;
+    mission: string;
+    bank: string;
+    fetchImpl: any;
+  }): Promise<{ messageSent: boolean; messageDetails?: any }> {
+    if (!opts.config?.api_url) return { messageSent: false };
+    const messages: any[] = [];
+    const mockPi = { sendMessage: (msg: any) => messages.push(msg) };
+    try {
+      const res = await opts.fetchImpl(`${opts.config.api_url}/v1/default/banks/${opts.bank}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${opts.config.api_key || ""}` },
+        body: JSON.stringify({ retain_mission: opts.mission }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      mockPi.sendMessage({ customType: "hindsight-mission", content: "", display: true, details: { bank: opts.bank, mission: opts.mission } });
+    } catch (_) {
+      return { messageSent: false };
+    }
+    return { messageSent: messages.length > 0, messageDetails: messages[0]?.details };
+  }
+
+  const config = { api_url: "http://localhost:8888", api_key: "k" };
+
+  test("sends hindsight-mission message on success", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: true, status: 200 }));
+    const result = await simulateSessionStartMission({
+      config, mission: "A React e-commerce app", bank: "project-myapp", fetchImpl: fetchMock,
+    });
+    assert.equal(result.messageSent, true);
+    assert.equal(result.messageDetails?.bank, "project-myapp");
+    assert.equal(result.messageDetails?.mission, "A React e-commerce app");
+  });
+
+  test("does not send message when config API fails", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 500 }));
+    const result = await simulateSessionStartMission({
+      config, mission: "some mission", bank: "project-myapp", fetchImpl: fetchMock,
+    });
+    assert.equal(result.messageSent, false);
+  });
+
+  test("does not send message on network error", async () => {
+    const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const result = await simulateSessionStartMission({
+      config, mission: "some mission", bank: "project-myapp", fetchImpl: fetchMock,
+    });
+    assert.equal(result.messageSent, false);
+  });
+
+  test("does not send message when no config", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: true, status: 200 }));
+    const result = await simulateSessionStartMission({
+      config: null, mission: "some mission", bank: "project-myapp", fetchImpl: fetchMock,
+    });
+    assert.equal(result.messageSent, false);
+    assert.equal(fetchMock.mock.calls.length, 0);
+  });
+});
+
+// ─── checkBankConfig tests ───────────────────────────────────────────────────
+
+describe("checkBankConfig", () => {
+  async function checkBankConfig(
+    config: { api_url: string; api_key?: string },
+    bank: string,
+    fetchImpl: any
+  ): Promise<{ ok: true; mission: string | null } | { ok: false; authError: boolean }> {
+    try {
+      const res = await fetchImpl(`${config.api_url}/v1/default/banks/${bank}/config`, {
+        headers: { "Authorization": `Bearer ${config.api_key || ""}` },
+      });
+      if (res.status === 401 || res.status === 403) return { ok: false, authError: true };
+      if (!res.ok) return { ok: false, authError: false };
+      const data = await res.json();
+      const mission = data.overrides?.retain_mission || data.config?.retain_mission || null;
+      return { ok: true, mission };
+    } catch (_) {
+      return { ok: false, authError: false };
+    }
+  }
+
+  const config = { api_url: "http://localhost:8888", api_key: "k" };
+
+  test("returns ok:true with mission when bank configured", async () => {
+    const fetchMock = mock.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ overrides: { retain_mission: "A cool project" }, config: {} }),
+    }));
+    const result = await checkBankConfig(config, "project-myapp", fetchMock);
+    assert.equal(result.ok, true);
+    assert.equal((result as any).mission, "A cool project");
+  });
+
+  test("returns ok:true with null mission when none set", async () => {
+    const fetchMock = mock.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ overrides: {}, config: {} }),
+    }));
+    const result = await checkBankConfig(config, "project-myapp", fetchMock);
+    assert.equal(result.ok, true);
+    assert.equal((result as any).mission, null);
+  });
+
+  test("returns authError:true on 401", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 401 }));
+    const result = await checkBankConfig(config, "project-myapp", fetchMock);
+    assert.equal(result.ok, false);
+    assert.equal((result as any).authError, true);
+  });
+
+  test("returns authError:true on 403", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 403 }));
+    const result = await checkBankConfig(config, "project-myapp", fetchMock);
+    assert.equal(result.ok, false);
+    assert.equal((result as any).authError, true);
+  });
+
+  test("returns authError:false on other HTTP errors", async () => {
+    const fetchMock = mock.fn(async () => ({ ok: false, status: 500 }));
+    const result = await checkBankConfig(config, "project-myapp", fetchMock);
+    assert.equal(result.ok, false);
+    assert.equal((result as any).authError, false);
+  });
+
+  test("returns authError:false on network error", async () => {
+    const fetchMock = mock.fn(async () => { throw new Error("ECONNREFUSED"); });
+    const result = await checkBankConfig(config, "project-myapp", fetchMock);
+    assert.equal(result.ok, false);
+    assert.equal((result as any).authError, false);
+  });
+});
+
+// ─── checkBankConfig tests ─────────────────────────────── (already above)
+
+// ─── hookStats tracking tests ────────────────────────────────────────────────
+
+describe("hookStats tracking", () => {
+  type HookRecord = { firedAt?: string; result?: string; detail?: string };
+
+  function makeHookStats() {
+    return { sessionStart: {} as HookRecord, recall: {} as HookRecord,
+             retain: {} as HookRecord, missionConfig: {} as HookRecord };
+  }
+
+  test("session_start marks firedAt and result:ok", () => {
+    const stats = makeHookStats();
+    stats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
+    assert.equal(stats.sessionStart.result, "ok");
+    assert.ok(stats.sessionStart.firedAt);
+  });
+
+  test("recall marks result:ok with memory count detail", () => {
+    const stats = makeHookStats();
+    stats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: "3 memories" };
+    assert.equal(stats.recall.result, "ok");
+    assert.ok(stats.recall.detail?.includes("3"));
+  });
+
+  test("recall marks result:failed with auth error detail", () => {
+    const stats = makeHookStats();
+    stats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "auth error" };
+    assert.equal(stats.recall.result, "failed");
+    assert.equal(stats.recall.detail, "auth error");
+  });
+
+  test("retain marks result:ok with bank names", () => {
+    const stats = makeHookStats();
+    stats.retain = { firedAt: new Date().toISOString(), result: "ok", detail: "project-myapp" };
+    assert.equal(stats.retain.result, "ok");
+    assert.ok(stats.retain.detail?.includes("project-myapp"));
+  });
+
+  test("retain marks result:failed when all banks unreachable", () => {
+    const stats = makeHookStats();
+    stats.retain = { firedAt: new Date().toISOString(), result: "failed", detail: "all banks unreachable" };
+    assert.equal(stats.retain.result, "failed");
+  });
+
+  test("missionConfig marks result:ok with mission snippet", () => {
+    const stats = makeHookStats();
+    stats.missionConfig = { firedAt: new Date().toISOString(), result: "ok", detail: "A React app" };
+    assert.equal(stats.missionConfig.result, "ok");
+  });
+
+  test("missionConfig marks result:failed with error", () => {
+    const stats = makeHookStats();
+    stats.missionConfig = { firedAt: new Date().toISOString(), result: "failed", detail: "HTTP 500" };
+    assert.equal(stats.missionConfig.result, "failed");
+  });
+
+  test("unfired hooks have empty firedAt", () => {
+    const stats = makeHookStats();
+    assert.equal(stats.recall.firedAt, undefined);
+    assert.equal(stats.retain.firedAt, undefined);
+  });
+});
+
+// ─── readRecentLogErrors tests ────────────────────────────────────────────────
+
+describe("readRecentLogErrors", () => {
+  function readRecentLogErrors(logPath: string, maxLines = 20): string[] {
+    try {
+      if (!existsSync(logPath)) return [];
+      const content = readFileSync(logPath, "utf-8");
+      return content.split("\n").filter(l => l.trim()).slice(-maxLines);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  test("returns empty array when log file does not exist", () => {
+    const result = readRecentLogErrors("/tmp/nonexistent-hindsight-log.txt");
+    assert.deepEqual(result, []);
+  });
+
+  test("returns last N lines of log file", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-log-test-"));
+    const logPath = pathJoin(dir, "debug.log");
+    try {
+      const lines = Array.from({ length: 30 }, (_, i) => `[2025] line ${i}`).join("\n");
+      writeFileSync(logPath, lines);
+      const result = readRecentLogErrors(logPath, 10);
+      assert.equal(result.length, 10);
+      assert.ok(result[0].includes("line 20"), `expected line 20, got: ${result[0]}`);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("returns all lines when fewer than maxLines", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-log-test-"));
+    const logPath = pathJoin(dir, "debug.log");
+    try {
+      writeFileSync(logPath, "line1\nline2\nline3\n");
+      const result = readRecentLogErrors(logPath, 20);
+      assert.equal(result.length, 3);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("skips blank lines", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-log-test-"));
+    const logPath = pathJoin(dir, "debug.log");
+    try {
+      writeFileSync(logPath, "line1\n\n\nline2\n");
+      const result = readRecentLogErrors(logPath, 20);
+      assert.equal(result.length, 2);
+    } finally { rmSync(dir, { recursive: true }); }
   });
 });
