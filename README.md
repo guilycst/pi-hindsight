@@ -1,163 +1,93 @@
-# Hindsight Self-Hosted Extension for Pi
+# pi-hindsight
 
-A fully autonomous Pi coding agent extension for integrating with a self-hosted [Hindsight](https://github.com/vectorize-io/hindsight) server. Brings persistent memory to your AI coding sessions with zero manual intervention.
-
-Recommended for most users running Hindsight in production, use self-hosted Hindsight for full data control and stable memory quality.
+Hindsight memory extension for [Pi](https://github.com/mariozechner/pi-coding-agent). Reads the same `~/.hindsight/claude-code.json` config as the Claude Code Hindsight plugin — one config, two agents.
 
 ## Install
 
-### Recommended
-
 ```bash
-pi install npm:pi-hindsight
+pi install git:github.com/guilycst/pi-hindsight
 ```
 
-### Git fallback
+## Setup
 
-```bash
-pi install git:github.com/anh-chu/pi-hindsight
+Create `~/.hindsight/claude-code.json` (shared with Claude Code plugin):
+
+```json
+{
+  "hindsightApiUrl": "https://your-hindsight-server.example.com",
+  "hindsightApiToken": "your-api-token",
+  "bankId": "my-project",
+  "recallTypes": ["world", "experience"],
+  "retainEveryNTurns": 10
+}
 ```
 
-## Why Hindsight + this extension
+| Field | Required | Description |
+|-------|----------|-------------|
+| `hindsightApiUrl` | ✅ | Hindsight API base URL |
+| `hindsightApiToken` | ✅ | API bearer token |
+| `bankId` | — | Primary bank ID. Falls back to `project-<dirname>` |
+| `recallTypes` | — | Memory types to recall. Default: `["world", "experience"]` |
+| `retainEveryNTurns` | — | Auto-retain every N turns. Default: `1` |
+| `globalBank` | — | Cross-project bank. Used with `#global` / `#me` tags |
 
-Quick take, this pairing helps memory stay useful without extra routine work.
-- **Graph and relationship aware retrieval:** Hindsight retrieval can use semantic, BM25, graph, and temporal strategies, so linked facts are easier to recover.
-- **Entity-aware memory:** people, projects, tools, and artifacts can be recalled as connected context instead of isolated snippets.
-- **Freshness-aware recall:** requests include `query_timestamp`, helping recent context rank higher when it matters.
-- **Project + global memory cooperation:** project bank handles local work history, optional global bank carries cross-project patterns.
-- **Visible and debuggable:** memory recall/retain events show in chat, manual tools exist when you want explicit control.
-- **Efficient retention path:** append-mode updates process new turn deltas, while still retaining important context from every turn.
-
-## How this compares to common agent memory patterns
-
-| Approach | Typical tradeoff | Hindsight + this extension |
-|---|---|---|
-| Markdown/file-based memory notes | Human-readable, but memory quality desaturates over time | Automatic retain + retrieval, still inspectable via banks/tools |
-| ChromaDB-style custom memory stack | Flexible, but requires ongoing schema/retrieval tuning | Built-in memory model + multi-strategy recall pipeline |
-| `pi-memex` style extension memory | Weak de-duplication, limited project/global cooperation | Observation-first recall with deduplication and project/global bank cooperation |
-| `pi-hippo-memory` style extension memory | Good bio-retention behavior, but old memories may be dropped based on policy | Explicit retain/recall hooks with tags, recall type controls, and bank-level persistence |
-
-If you need long-lived, inspectable memory for coding agents, this setup is practical default.
+Env var overrides: `HINDSIGHT_API_URL`, `HINDSIGHT_API_TOKEN`.
 
 ## Features
 
 ### Automatic Memory Lifecycle
 
-- **Auto-Recall:** Before each agent turn, queries the project bank and injects relevant memories directly into the prompt. Zero agent action needed.
-- **Auto-Retain:** After each agent turn, appends the conversation transcript to a per-session document (`update_mode: append`) using a stable `document_id`. Hindsight only re-extracts the new delta — no redundant LLM calls.
-- **Feedback Loop Prevention:** Strips `<hindsight_memories>` blocks from the transcript before retain. Prevents recursive memory bloat.
-- **Operational Tool Filtering:** Drops low-signal tools (bash, read, write, edit, etc.) from the retained transcript. Keeps conversation and non-trivial tool calls only.
+- **Auto-Recall** (`before_agent_start`): Queries configured banks and injects relevant memories into context. Retries up to 3 times on failure.
+- **Auto-Retain** (`agent_end`): Appends conversation transcript to a per-session document. Uses `async: true` for reliability.
+- **Compaction reset**: Re-triggers recall after `/compact`.
+- **Feedback loop prevention**: Strips `<hindsight_memories>` from retained transcripts.
+- **Operational tool filtering**: Drops low-signal tools (bash, read, write, edit) from transcripts.
 
-### Memory Quality
+### Opt-In / Opt-Out
 
-- **Observation-Focused Recall:** Defaults to `observation` type only — consolidated, deduplicated beliefs synthesized from multiple memories. Highest signal, lowest noise. Configurable per-project.
-- **Rich Retain Context:** Each retain includes `context` (derived from the user's prompt), `timestamp`, `document_id`, and `update_mode: append` for best extraction quality.
-- **Temporal Recall:** Recall requests include `query_timestamp` so Hindsight can rank memories by recency.
-- **Budget-Based Recall:** Uses `budget: "mid"` for proper retrieval tuning.
+- `#nomem` or `#skip` — skip retain for that turn
+- `#global` or `#me` — also retain to the global bank
+- Custom `#tags` — extracted and attached for filtering
 
-### Opt-In / Opt-Out Controls
+### Manual Tools
 
-- `#nomem` or `#skip` at the start of a prompt — skip retain for that turn.
-- `#global` or `#me` anywhere in a prompt — also retain to your `global_bank` (cross-project learnings).
-- Custom hashtags (e.g. `#architecture`, `#bug`) — extracted and attached as Hindsight tags for filtering.
+| Tool | Description |
+|------|-------------|
+| `hindsight_recall` | Search memory explicitly |
+| `hindsight_retain` | Force-save an insight (with optional tags) |
+| `hindsight_reflect` | Synthesize answers from stored knowledge |
+
+### Commands
+
+- `/hindsight` — Show status (config, health, auth, hook state, debug log)
+- `/hindsight stats` — Memory/entity/document counts for active banks
 
 ### In-Chat Visibility
-
-Every memory event is visible in the Pi chat:
 
 | Event | Display |
 |-------|---------|
 | Recall | `🧠 Hindsight recalled N memories` + snippet |
-| Retain (success) | `💾 Hindsight saved turn to memory → bank-name` |
-| Retain (failure) | `💾 Hindsight retain failed — use hindsight_retain to save manually` |
+| Retain | `💾 Hindsight saved turn to memory → bank-name` |
+| Retain failed | `💾 Hindsight retain failed — use hindsight_retain to save manually` |
 
-### Manual Tools
+## Debug
 
-Two tools available for explicit memory management:
+Set `HINDSIGHT_DEBUG=1` to enable logging to `~/.hindsight/debug-pi.log`.
 
-- `hindsight_recall` — Manually pull additional context from memory
-- `hindsight_retain` — Force-save a specific insight
-
-## Setup
-
-1. Install this extension:
-   ```bash
-   pi install npm:pi-hindsight
-   ```
-
-2. Configure your Hindsight server credentials in `~/.hindsight/config`:
-   ```toml
-   api_url = "http://your-hindsight-server:8888"
-   api_key = "<API_KEY>"
-   global_bank = "optional-global-bank-id"
-   ```
-
-3. Run `/hindsight status` in Pi to verify everything is working.
-
-No further setup needed — memory is fully automatic from the first session.
-
-## Configuration
-
-### Global config: `~/.hindsight/config`
-
-```toml
-api_url      = "http://localhost:8888"
-api_key      = "your-api-key"
-global_bank  = "sil"
-recall_types = "observation"
-```
-
-### Project override: `.hindsight/config` (in project root)
-
-Place a `.hindsight/config` file in any project directory to override global settings for that project. Local values win.
-
-```toml
-# Include raw events alongside observations for this project
-recall_types = "observation,experience"
-```
-
-**`recall_types`** — comma-separated list of memory types to search during recall. Accepted values: `observation`, `world`, `experience`. Defaults to `observation`. Each type runs the full 4-strategy retrieval pipeline independently, so narrowing this reduces both result set size and query cost.
-
-## Commands
-
-### `/hindsight status`
-Full health check for the current session:
-- Server reachability
-- Auth validity
-- Project bank accessibility
-- Hook execution state (session_start, recall, retain)
-- Debug log tail (when `HINDSIGHT_DEBUG=1`)
-
-Example output:
-```
-URL:    http://localhost:8888
-Server: ✓ online
-Bank:   project-myapp
-  ✓ auth ok
-Global: global-bank
-
-Hooks this session:
-  session_start:      ✓ ok
-  recall:             ✓ ok (3 memories)
-  retain:             ✓ ok (project-myapp)
-
-Debug log: disabled (set HINDSIGHT_DEBUG=1 to enable)
-```
-
-### `/hindsight stats`
-Shows memory/entity/document counts for all active banks.
-
-## Debug Logging
-
-Set `HINDSIGHT_DEBUG=1` to enable verbose logging to `~/.hindsight/debug.log`. Log tail is shown inline in `/hindsight status`.
-
-## Banks
-
-- **Project bank** (`project-<dirname>`) — auto-created per working directory. All turns are retained here by default.
-- **Global bank** — optional, configured via `global_bank` in `~/.hindsight/config`. Receives turns tagged `#global` or `#me`.
-
-## Running Tests
+## Smoke Test
 
 ```bash
-node --experimental-strip-types test.ts
+node --experimental-strip-types smoke-test.ts
 ```
+
+Tests config loading, health, retain lifecycle, recall lifecycle (graceful on 504), manual tools, auth error handling, and status commands against a live API.
+
+## Changes from upstream (anh-chu/pi-hindsight)
+
+- **Config**: Reads `~/.hindsight/claude-code.json` (JSON) instead of `~/.hindsight/config` (key=value). Shares config with Claude Code plugin.
+- **Bank ID**: Supports explicit `bankId` from config (e.g. `"claude_code"`) with fallback to `project-<dirname>`.
+- **Recall types**: Defaults to `["world", "experience"]` matching our Claude Code plugin convention.
+- **URL encoding**: Bank IDs are `encodeURIComponent`'d in all API paths.
+- **Retain**: Uses `async: true` for reliability under heavy server load.
+- **Tags**: Manual retain tool accepts optional `tags` parameter.
+- **Aborts**: Recall timeouts handled gracefully (504 treated as non-fatal).

@@ -1,10 +1,10 @@
 {
   "name": "pi-hindsight",
-  "version": "1.0.1",
-  "description": "Hindsight self-hosted memory extension for Pi",
+  "version": "1.1.0",
+  "description": "Hindsight memory extension for Pi — reads ~/.hindsight/claude-code.json config",
   "type": "module",
-  "main": "index.js",
-  "license": "ISC",
+  "main": "index.ts",
+  "license": "MIT",
   "keywords": [
     "pi-package",
     "pi",
@@ -13,7 +13,6 @@
     "memory"
   ],
   "files": [
-    "index.js",
     "index.ts",
     "skills",
     "README.md"
@@ -23,7 +22,7 @@
   },
   "pi": {
     "extensions": [
-      "index.js"
+      "index.ts"
     ],
     "skills": [
       "skills"
@@ -31,30 +30,16 @@
   },
   "scripts": {
     "test": "node --experimental-strip-types test.ts",
-    "build": "tsc index.ts",
-    "check": "npm run build"
+    "check": "tsc --noEmit index.ts"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anh-chu/pi-hindsight.git"
+    "url": "git+https://github.com/guilycst/pi-hindsight.git"
   },
-  "homepage": "https://github.com/anh-chu/pi-hindsight#readme",
-  "bugs": {
-    "url": "https://github.com/anh-chu/pi-hindsight/issues"
-  },
-  "author": "",
+  "homepage": "https://github.com/guilycst/pi-hindsight#readme",
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*"
-  },
-  "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.66.1",
     "@mariozechner/pi-tui": "*",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "@sinclair/typebox": "^0.34.49"
-  },
-  "devDependencies": {
-    "@types/node": "^25.6.0",
-    "typescript": "^6.0.2"
+    "@sinclair/typebox": "*"
   }
 }

@@ -1,11 +1,20 @@
 /**
  * Hindsight Self-Hosted Extension for Pi
- * Fully autonomous memory via lifecycle hooks.
+ *
+ * Fully autonomous memory via lifecycle hooks. Adapted for the TKS monorepo
+ * Hindsight deployment — reads from the same ~/.hindsight/claude-code.json
+ * config used by the Claude Code plugin, with env var overrides.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  appendFileSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { Type } from "@sinclair/typebox";
@@ -15,155 +24,207 @@ import { Type } from "@sinclair/typebox";
 // ---------------------------------------------------------------------------
 
 const DEBUG = process.env.HINDSIGHT_DEBUG === "1";
-const LOG_PATH = join(homedir(), ".hindsight", "debug.log");
+const LOG_DIR = join(homedir(), ".hindsight");
+const LOG_PATH = join(LOG_DIR, "debug-pi.log");
 
 function log(msg: string) {
   if (!DEBUG) return;
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   try {
-    mkdirSync(join(homedir(), ".hindsight"), { recursive: true });
+    mkdirSync(LOG_DIR, { recursive: true });
     appendFileSync(LOG_PATH, line);
   } catch (_) {}
 }
 
 // ---------------------------------------------------------------------------
-// Config & Helpers
+// Config — reads the same JSON config as the Claude Code plugin
 // ---------------------------------------------------------------------------
 
 interface HindsightConfig {
-  api_url?: string;
-  api_key?: string;
+  api_url: string;
+  api_key: string;
+  /** Explicit bank ID from config (e.g. "totvs-work"). Overrides project-based derivation. */
+  bank_id?: string;
+  /** Optional global/cross-project bank */
   global_bank?: string;
-  recall_types?: string[];
+  recall_types: string[];
+  recall_budget: string;
+  recall_max_tokens: number;
+  recall_max_query_chars: number;
+  retain_every_n_turns: number;
+  auto_recall: boolean;
+  auto_retain: boolean;
 }
 
-function parseConfigFile(filePath: string): Record<string, string> {
-  const raw = readFileSync(filePath, "utf-8");
-  const config: Record<string, string> = {};
-  for (const line of raw.split("\n")) {
-    const match = line.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*["']?(.*?)["']?\s*$/);
-    if (match) config[match[1]] = match[2];
+const CONFIG_DEFAULTS: Omit<HindsightConfig, "api_url" | "api_key"> = {
+  bank_id: undefined,
+  global_bank: undefined,
+  recall_types: ["world", "experience"],
+  recall_budget: "mid",
+  recall_max_tokens: 1024,
+  recall_max_query_chars: 800,
+  retain_every_n_turns: 1,
+  auto_recall: true,
+  auto_retain: true,
+};
+
+/**
+ * Load config from ~/.hindsight/claude-code.json (same as Claude Code plugin)
+ * with env var overrides.
+ */
+function loadConfig(): HindsightConfig | null {
+  const configPath = join(homedir(), ".hindsight", "claude-code.json");
+  if (!existsSync(configPath)) {
+    log(`config: ${configPath} not found`);
+    return null;
   }
-  return config;
-}
-function getConfig(): HindsightConfig | null {
+
   try {
-    const globalCfgPath = join(homedir(), ".hindsight", "config");
-    if (!existsSync(globalCfgPath)) return null;
+    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+    const api_url =
+      process.env.HINDSIGHT_API_URL || raw.hindsightApiUrl || "";
+    const api_key =
+      process.env.HINDSIGHT_API_TOKEN || raw.hindsightApiToken || "";
 
-    const global = parseConfigFile(globalCfgPath);
+    if (!api_url) {
+      log("config: no api_url configured");
+      return null;
+    }
 
-    // Project-level override: .hindsight/config in CWD
-    const localCfgPath = join(process.cwd(), ".hindsight", "config");
-    const local = existsSync(localCfgPath) ? parseConfigFile(localCfgPath) : {};
-
-    const merged = { ...global, ...local };
-
-    const recallTypesRaw = merged.recall_types;
-    const recall_types = recallTypesRaw
-      ? recallTypesRaw.split(",").map((t) => t.trim()).filter(Boolean)
-      : ["observation"];
     return {
-      api_url: merged.api_url,
-      api_key: merged.api_key,
-      global_bank: merged.global_bank || merged.bank_id,
-      recall_types,
+      api_url: api_url.replace(/\/$/, ""),
+      api_key,
+      bank_id: raw.bankId || raw.bank_id,
+      global_bank: raw.globalBank || raw.global_bank,
+      recall_types: raw.recallTypes || CONFIG_DEFAULTS.recall_types,
+      recall_budget: raw.recallBudget || CONFIG_DEFAULTS.recall_budget,
+      recall_max_tokens:
+        raw.recallMaxTokens || CONFIG_DEFAULTS.recall_max_tokens,
+      recall_max_query_chars:
+        raw.recallMaxQueryChars || CONFIG_DEFAULTS.recall_max_query_chars,
+      retain_every_n_turns:
+        raw.retainEveryNTurns || CONFIG_DEFAULTS.retain_every_n_turns,
+      auto_recall: raw.autoRecall !== false,
+      auto_retain: raw.autoRetain !== false,
     };
   } catch (e) {
+    log(`config: failed to parse ${configPath}: ${e}`);
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Bank derivation
+// ---------------------------------------------------------------------------
 
 function getProjectBank(): string {
   return `project-${basename(process.cwd())}`;
 }
 
+/** The primary bank for recall and retain — config bank_id or project-derived */
+function getPrimaryBank(config: HindsightConfig): string {
+  return config.bank_id || getProjectBank();
+}
+
+/** All banks to query during recall */
 function getRecallBanks(config: HindsightConfig): string[] {
   const banks = new Set<string>();
+  banks.add(getPrimaryBank(config));
   if (config.global_bank) banks.add(config.global_bank);
-  banks.add(getProjectBank());
   return Array.from(banks);
 }
 
-function getRetainBanks(config: HindsightConfig, prompt: string): string[] {
+/** Banks to retain to (project bank always; global bank only with #global/#me) */
+function getRetainBanks(
+  config: HindsightConfig,
+  prompt: string
+): string[] {
   const banks = new Set<string>();
-  banks.add(getProjectBank());
-  
-  // Opt-in for global bank retention
-  if (config.global_bank && (prompt.includes("#global") || prompt.includes("#me"))) {
+  banks.add(getPrimaryBank(config));
+  if (
+    config.global_bank &&
+    (prompt.includes("#global") || prompt.includes("#me"))
+  ) {
     banks.add(config.global_bank);
   }
   return Array.from(banks);
 }
 
-function getLastUserMessage(ctx: any, fallbackPrompt: string): string {
+// ---------------------------------------------------------------------------
+// API client helpers
+// ---------------------------------------------------------------------------
+
+function apiHeaders(config: HindsightConfig): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${config.api_key}`,
+    "User-Agent": "pi-hindsight/1.0.0",
+  };
+}
+
+async function apiGet<T = any>(
+  config: HindsightConfig,
+  path: string
+): Promise<{ ok: true; data: T } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`${config.api_url}${path}`, {
+      headers: apiHeaders(config),
+    });
+    if (!res.ok) return { ok: false, status: res.status };
+    const data = (await res.json()) as T;
+    return { ok: true, data };
+  } catch (_) {
+    return { ok: false, status: 0 };
+  }
+}
+
+async function apiPost<T = any>(
+  config: HindsightConfig,
+  path: string,
+  body: unknown
+): Promise<{ ok: true; data: T } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`${config.api_url}${path}`, {
+      method: "POST",
+      headers: apiHeaders(config),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return { ok: false, status: res.status };
+    const data = (await res.json()) as T;
+    return { ok: true, data };
+  } catch (_) {
+    return { ok: false, status: 0 };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function getLastUserMessage(ctx: any, fallback: string): string {
   try {
     const entries = ctx.sessionManager?.getEntries() || [];
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i];
       if (e.type === "message" && e.message?.role === "user") {
-        return typeof e.message.content === "string" 
-          ? e.message.content 
-          : JSON.stringify(e.message.content);
+        const content = e.message.content;
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+          const textBlock = content.find(
+            (b: any) => b.type === "text"
+          );
+          if (textBlock) return textBlock.text;
+        }
+        return JSON.stringify(content);
       }
     }
-  } catch (e) {}
-  return fallbackPrompt;
+  } catch (_) {}
+  return fallback;
 }
 
-
-
-async function getBankMission(config: HindsightConfig, bank: string): Promise<string | null> {
-  try {
-    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/profile`, {
-      headers: { "Authorization": `Bearer ${config.api_key || ""}` }
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.mission || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-async function checkBankConfig(config: HindsightConfig, bank: string): Promise<
-  | { ok: true; mission: string | null }
-  | { ok: false; authError: boolean }
-> {
-  try {
-    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/profile`, {
-      headers: { "Authorization": `Bearer ${config.api_key || ""}` }
-    });
-    if (res.status === 401 || res.status === 403) return { ok: false, authError: true };
-    if (!res.ok) return { ok: false, authError: false };
-    const data = await res.json();
-    return { ok: true, mission: data.mission || null };
-  } catch (_) {
-    return { ok: false, authError: false };
-  }
-}
-
-async function getServerHealth(config: HindsightConfig): Promise<{ ok: boolean; status?: number }> {
-  try {
-    const res = await fetch(`${config.api_url}/health`, {
-      headers: { "Authorization": `Bearer ${config.api_key || ""}` }
-    });
-    return { ok: res.ok, status: res.status };
-  } catch (_) {
-    return { ok: false };
-  }
-}
-
-async function getBankStats(config: HindsightConfig, bank: string): Promise<Record<string, number> | null> {
-  try {
-    const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/stats`, {
-      headers: { "Authorization": `Bearer ${config.api_key || ""}` }
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (_) {
-    return null;
-  }
+function truncateQuery(query: string, maxChars: number): string {
+  if (query.length <= maxChars) return query;
+  return query.slice(0, maxChars);
 }
 
 interface HookRecord {
@@ -182,49 +243,61 @@ const hookStats: {
   retain: {},
 };
 
-function readRecentLogErrors(maxLines = 20): string[] {
+const OPERATIONAL_TOOLS = new Set([
+  "bash",
+  "nu",
+  "process",
+  "read",
+  "write",
+  "edit",
+  "grep",
+  "ast_grep_search",
+  "ast_grep_replace",
+  "lsp_navigation",
+]);
+
+function readRecentLogLines(maxLines = 20): string[] {
   try {
     if (!existsSync(LOG_PATH)) return [];
-    const content = readFileSync(LOG_PATH, "utf-8");
-    return content
+    return readFileSync(LOG_PATH, "utf-8")
       .split("\n")
-      .filter(l => l.trim())
+      .filter((l) => l.trim())
       .slice(-maxLines);
   } catch (_) {
     return [];
   }
 }
-const OPERATIONAL_TOOLS = [
-  "bash", "nu", "process", "read", "write", "edit", 
-  "grep", "ast_grep_search", "ast_grep_replace", "lsp_navigation"
-];
+
+const MAX_RECALL_ATTEMPTS = 3;
 
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
-const MAX_RECALL_ATTEMPTS = 3;
-
 export default function hindsightExtension(pi: ExtensionAPI) {
   let recallDone = false;
   let recallAttempts = 0;
   let currentPrompt = "";
+  let turnCounter = 0;
 
   // Track user input for fallback
   pi.on("input", async (event: any) => {
-    if (event.input) currentPrompt = event.input;
-    else if (event.text) currentPrompt = event.text;
+    if (event.text) currentPrompt = event.text;
   });
 
+  // ── Session lifecycle ──────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
     recallDone = false;
     recallAttempts = 0;
-    hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
+    turnCounter = 0;
+    hookStats.sessionStart = {
+      firedAt: new Date().toISOString(),
+      result: "ok",
+    };
     hookStats.recall = {};
     hookStats.retain = {};
     ctx.ui.setStatus("hindsight", undefined);
     log("session_start: state reset");
-    const config = getConfig();
   });
 
   pi.on("session_compact", async (_event, ctx) => {
@@ -234,279 +307,244 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     log("session_compact: state reset");
   });
 
-  pi.registerMessageRenderer("hindsight-recall", (message, _options, theme) => {
-    const count: number = (message.details as any)?.count ?? 0;
-    const snippet: string = (message.details as any)?.snippet ?? "";
-    let text = theme.fg("accent", "🧠 Hindsight");
-    text += theme.fg("muted", ` recalled ${count} ${count === 1 ? "memory" : "memories"}`);
-    if (snippet) {
-      text += "\n" + theme.fg("dim", snippet);
-    }
-    return new Text(text, 0, 0);
-  });
-
-
-  pi.registerMessageRenderer("hindsight-retain", (message, _options, theme) => {
-    const banks: string[] = (message.details as any)?.banks ?? [];
-    let text = theme.fg("accent", "💾 Hindsight");
-    text += theme.fg("muted", ` saved turn to memory`);
-    if (banks.length > 0) {
-      text += theme.fg("dim", ` → ${banks.join(", ")}`);
-    }
-    return new Text(text, 0, 0);
-  });
-
-  pi.registerMessageRenderer("hindsight-retain-failed", (_message, _options, theme) => {
-    let text = theme.fg("error", "💾 Hindsight");
-    text += theme.fg("muted", " retain failed — use ");
-    text += theme.fg("accent", "hindsight_retain");
-    text += theme.fg("muted", " to save manually");
-    return new Text(text, 0, 0);
-  });
-
-  // -----------------------------------------------------------------------
-  // Explicit Manual Tools (for when the background loop isn't enough)
-  // -----------------------------------------------------------------------
-  pi.registerTool({
-    name: "hindsight_recall",
-    label: "Hindsight Recall",
-    description: "Recall relevant context, conventions, or past solutions from the team memory. Use this when the user explicitly asks you to search memory.",
-    parameters: Type.Object({
-      query: Type.String()
-    }),
-    async execute(_id, params) {
-      const { query } = params as { query: string };
-      const config = getConfig();
-      if (!config || !config.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
-
-      const banks = getRecallBanks(config);
-      try {
-        const recallPromises = banks.map(async (bank) => {
-          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${config.api_key || ""}`
-            },
-            body: JSON.stringify({ query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
-          });
-          if (!res.ok) return [];
-          const data = await res.json();
-          return (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
-        });
-
-        const resultsArrays = await Promise.all(recallPromises);
-        const allResults = resultsArrays.flat();
-        if (allResults.length > 0) {
-          return { content: [{ type: "text" as const, text: allResults.join("\n\n") }], details: {} };
-        }
-        return { content: [{ type: "text" as const, text: "No memories found." }], details: {} };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
+  // ── Message renderers ──────────────────────────────────────────────────
+  pi.registerMessageRenderer(
+    "hindsight-recall",
+    (message, _options, theme) => {
+      const count: number = (message.details as any)?.count ?? 0;
+      const snippet: string = (message.details as any)?.snippet ?? "";
+      let text = theme.fg("accent", "🧠 Hindsight");
+      text += theme.fg(
+        "muted",
+        ` recalled ${count} ${count === 1 ? "memory" : "memories"}`
+      );
+      if (snippet) {
+        text += "\n" + theme.fg("dim", snippet);
       }
+      return new Text(text, 0, 0);
     }
-  });
+  );
 
-  pi.registerTool({
-    name: "hindsight_retain",
-    label: "Hindsight Retain",
-    description: "Force-save an explicit insight to memory. Only use when explicitly requested by the user, as normal conversation is auto-retained.",
-    parameters: Type.Object({
-      content: Type.String({ description: "The rich context to save" })
-    }),
-    async execute(_id, params) {
-      const { content } = params as { content: string };
-      const config = getConfig();
-      if (!config || !config.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
-
-      const bank = getProjectBank();
-      try {
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${config.api_key || ""}`
-          },
-          body: JSON.stringify({ items: [{ content, context: "pi coding session: explicit user save", timestamp: new Date().toISOString() }], async: false })
-        });
-        if (res.ok) return { content: [{ type: "text" as const, text: "Memory explicitly retained." }], details: {} };
-        return { content: [{ type: "text" as const, text: "Failed to retain memory." }], details: {}, isError: true };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
+  pi.registerMessageRenderer(
+    "hindsight-retain",
+    (message, _options, theme) => {
+      const banks: string[] = (message.details as any)?.banks ?? [];
+      let text = theme.fg("accent", "💾 Hindsight");
+      text += theme.fg("muted", " saved turn to memory");
+      if (banks.length > 0) {
+        text += theme.fg("dim", ` → ${banks.join(", ")}`);
       }
+      return new Text(text, 0, 0);
     }
-  });
+  );
 
-  pi.registerTool({
-    name: "hindsight_reflect",
-    label: "Hindsight Reflect",
-    description: "Synthesize context from memory to answer a question.",
-    parameters: Type.Object({
-      query: Type.String()
-    }),
-    async execute(_id, params) {
-      const { query } = params as { query: string };
-      const config = getConfig();
-      if (!config || !config.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
-
-      const bank = getProjectBank();
-      try {
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/reflect`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${config.api_key || ""}`
-          },
-          body: JSON.stringify({ query })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          return { content: [{ type: "text" as const, text: data.synthesis || JSON.stringify(data) }], details: {} };
-        }
-        return { content: [{ type: "text" as const, text: "Failed to reflect." }], details: {}, isError: true };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
-      }
+  pi.registerMessageRenderer(
+    "hindsight-retain-failed",
+    (_message, _options, theme) => {
+      let text = theme.fg("error", "💾 Hindsight");
+      text += theme.fg("muted", " retain failed — use ");
+      text += theme.fg("accent", "hindsight_retain");
+      text += theme.fg("muted", " to save manually");
+      return new Text(text, 0, 0);
     }
-  });
+  );
 
-  // -----------------------------------------------------------------------
+  // ── Auto-Recall (before_agent_start) ───────────────────────────────────
   pi.on("before_agent_start", async (_event, ctx) => {
+    if (!loadConfig()?.auto_recall) {
+      log("before_agent_start: auto-recall disabled");
+      return;
+    }
+
     if (recallDone) {
       log("before_agent_start: skip (recallDone=true)");
       return;
     }
     if (recallAttempts >= MAX_RECALL_ATTEMPTS) {
-      log(`before_agent_start: skip (max attempts ${MAX_RECALL_ATTEMPTS} reached)`);
+      log(
+        `before_agent_start: skip (max attempts ${MAX_RECALL_ATTEMPTS} reached)`
+      );
       return;
     }
 
     recallAttempts++;
-    log(`before_agent_start: attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS}`);
+    log(
+      `before_agent_start: attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS}`
+    );
 
-    const config = getConfig();
-    if (!config || !config.api_url) {
+    const config = loadConfig();
+    if (!config) {
       log("before_agent_start: no config, giving up");
-      recallAttempts = MAX_RECALL_ATTEMPTS; // don't retry — config won't change mid-session
+      recallAttempts = MAX_RECALL_ATTEMPTS;
       ctx.ui.setStatus("hindsight", "⚠ not configured");
       return;
     }
 
-    const lastUserPrompt = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
+    const userPrompt = getLastUserMessage(ctx, currentPrompt) || "";
+    const query = truncateQuery(userPrompt, config.recall_max_query_chars);
+    if (query.length < 5) {
+      log("before_agent_start: query too short, skipping");
+      return;
+    }
+
     const banks = getRecallBanks(config);
-    log(`before_agent_start: querying banks=${banks.join(",")} prompt="${lastUserPrompt.slice(0, 80)}"`);
+    log(
+      `before_agent_start: querying banks=${banks.join(",")} query="${query.slice(0, 80)}"`
+    );
 
     try {
-      let anyBankSucceeded = false;
       let authFailed = false;
+      let anySucceeded = false;
+
       const recallPromises = banks.map(async (bank) => {
-        const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${config.api_key || ""}`
-          },
-          body: JSON.stringify({ query: lastUserPrompt, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types })
+        const bankPath = encodeURIComponent(bank);
+        const result = await apiPost(config, `/v1/default/banks/${bankPath}/memories/recall`, {
+          query,
+          budget: config.recall_budget,
+          max_tokens: config.recall_max_tokens,
+          query_timestamp: new Date().toISOString(),
+          types: config.recall_types,
         });
 
-        if (!res.ok) {
-          log(`before_agent_start: bank=${bank} HTTP ${res.status}`);
-          if (res.status === 401 || res.status === 403) authFailed = true;
+        if (!result.ok) {
+          log(`before_agent_start: bank=${bank} HTTP ${result.status}`);
+          if (result.status === 401 || result.status === 403)
+            authFailed = true;
           return [];
         }
-        anyBankSucceeded = true;
-        const data = await res.json();
-        const results = (data.results || []).map((r: any) => `[Bank: ${bank}] - ${r.text}`);
+
+        anySucceeded = true;
+        const results = (result.data as any).results || [];
         log(`before_agent_start: bank=${bank} got ${results.length} results`);
-        return results;
+        return results.map((r: any) => `[Bank: ${bank}] - ${r.text}`);
       });
 
-      const resultsArrays = await Promise.all(recallPromises);
+      const allResults = (await Promise.all(recallPromises)).flat();
 
       if (authFailed) {
-        hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "auth error" };
-        recallAttempts = MAX_RECALL_ATTEMPTS; // auth won't fix itself mid-session
+        hookStats.recall = {
+          firedAt: new Date().toISOString(),
+          result: "failed",
+          detail: "auth error",
+        };
+        recallAttempts = MAX_RECALL_ATTEMPTS;
         ctx.ui.setStatus("hindsight", "✗ auth error — check api_key");
         log("before_agent_start: auth error, giving up");
         return;
       }
 
-      if (anyBankSucceeded) {
+      if (anySucceeded) {
         recallDone = true;
         ctx.ui.setStatus("hindsight", undefined);
-        const allResults = resultsArrays.flat();
+
         if (allResults.length > 0) {
-          hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: `${allResults.length} memories` };
-          log(`before_agent_start: injecting ${allResults.length} memories into context`);
+          hookStats.recall = {
+            firedAt: new Date().toISOString(),
+            result: "ok",
+            detail: `${allResults.length} memories`,
+          };
+          log(
+            `before_agent_start: injecting ${allResults.length} memories into context`
+          );
           const memoriesStr = allResults.join("\n\n");
           const content = `<hindsight_memories>\nRelevant memories from past conversations:\n\n${memoriesStr}\n</hindsight_memories>`;
-          const count = allResults.length;
           const snippet = allResults
             .slice(0, 3)
             .map((r: string) => r.replace(/^\[Bank: [^\]]+\] - /, ""))
-            .join(" \u00b7 ")
+            .join(" · ")
             .slice(0, 200);
+
           return {
             message: {
               customType: "hindsight-recall",
               content,
               display: true,
-              details: { count, snippet }
-            }
+              details: { count: allResults.length, snippet },
+            },
           };
         } else {
-          hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: "vault empty" };
+          hookStats.recall = {
+            firedAt: new Date().toISOString(),
+            result: "ok",
+            detail: "empty vault",
+          };
           log("before_agent_start: no memories found (empty vault)");
         }
       } else {
-        const isLastAttempt = recallAttempts >= MAX_RECALL_ATTEMPTS;
-        hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: isLastAttempt ? "unreachable" : "retrying" };
-        ctx.ui.setStatus("hindsight", isLastAttempt ? "✗ recall unavailable" : "⚠ recall failed (retrying)");
-        log(`before_agent_start: all banks failed, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
+        const isLast = recallAttempts >= MAX_RECALL_ATTEMPTS;
+        hookStats.recall = {
+          firedAt: new Date().toISOString(),
+          result: "failed",
+          detail: isLast ? "unreachable" : "retrying",
+        };
+        ctx.ui.setStatus(
+          "hindsight",
+          isLast
+            ? "✗ recall unavailable"
+            : "⚠ recall failed (retrying)"
+        );
       }
     } catch (e) {
-      const isLastAttempt = recallAttempts >= MAX_RECALL_ATTEMPTS;
-      ctx.ui.setStatus("hindsight", isLastAttempt ? "✗ recall unavailable" : "⚠ recall failed (retrying)");
-      log(`before_agent_start: error ${e}, will retry (attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS})`);
+      const isLast = recallAttempts >= MAX_RECALL_ATTEMPTS;
+      ctx.ui.setStatus(
+        "hindsight",
+        isLast
+          ? "✗ recall unavailable"
+          : "⚠ recall failed (retrying)"
+      );
+      log(`before_agent_start: error ${e}`);
     }
   });
 
-  // -----------------------------------------------------------------------
-  // Auto-Retain (agent_end)
-  // -----------------------------------------------------------------------
+  // ── Auto-Retain (agent_end) ────────────────────────────────────────────
   pi.on("agent_end", async (event: any, ctx) => {
     log("agent_end: fired");
-    const config = getConfig();
-    if (!config || !config.api_url) {
-      log("agent_end: no config, skipping");
+
+    const config = loadConfig();
+    if (!config || !config.auto_retain) {
+      log("agent_end: auto-retain disabled or no config");
       return;
     }
 
-    const lastUserPrompt = getLastUserMessage(ctx, currentPrompt);
-    const sessionId = ctx.sessionManager?.getSessionId?.() || `unknown-${Date.now()}`;
-    if (!lastUserPrompt) {
+    turnCounter++;
+    if (turnCounter % config.retain_every_n_turns !== 0) {
+      log(
+        `agent_end: turn ${turnCounter}, skipping (retain every ${config.retain_every_n_turns})`
+      );
+      return;
+    }
+
+    const userPrompt = getLastUserMessage(ctx, currentPrompt);
+    if (!userPrompt || userPrompt.length < 5) {
       log("agent_end: no user prompt found, skipping");
       return;
     }
 
     // Skip trivial interactions
-    if (lastUserPrompt.length < 5 || /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(lastUserPrompt.trim())) {
-      log(`agent_end: trivial prompt, skipping retain`);
+    if (
+      /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(
+        userPrompt.trim()
+      )
+    ) {
+      log("agent_end: trivial prompt, skipping");
       return;
     }
 
-    // Opt-out mechanism
-    if (lastUserPrompt.trim().startsWith("#nomem") || lastUserPrompt.trim().startsWith("#skip")) {
-      log("agent_end: opt-out tag, skipping retain");
+    // Opt-out
+    if (
+      userPrompt.trim().startsWith("#nomem") ||
+      userPrompt.trim().startsWith("#skip")
+    ) {
+      log("agent_end: opt-out tag, skipping");
       return;
     }
 
-    let transcript = `[role: user]\n${lastUserPrompt}\n[user:end]\n\n[role: assistant]\n`;
+    // Build transcript
+    let transcript = `[role: user]\n${userPrompt}\n\n[role: assistant]\n`;
 
     const messages = event.messages || [];
     for (const msg of messages) {
       if (msg.role !== "assistant") continue;
-
       const content = msg.content;
       if (typeof content === "string") {
         transcript += `${content}\n`;
@@ -515,76 +553,79 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           if (block.type === "text") {
             transcript += `${block.text}\n`;
           } else if (block.type === "tool_use") {
-            if (!OPERATIONAL_TOOLS.includes(block.name)) {
-              transcript += `[Tool Use: ${block.name}]\n`;
-              if (block.input) {
-                transcript += `${JSON.stringify(block.input)}\n`;
-              }
+            if (!OPERATIONAL_TOOLS.has(block.name)) {
+              transcript += `[Tool: ${block.name}] ${JSON.stringify(block.input || {})}\n`;
             }
           }
         }
       }
     }
-    
-    transcript += `[assistant:end]`;
-    // Extract explicit #tags from the user prompt (ignoring our reserved control tags)
+
+    // Strip feedback loop
+    transcript = transcript.replace(
+      /<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g,
+      ""
+    );
+
+    // Extract user #tags (excluding reserved)
     const reservedTags = new Set(["nomem", "skip", "global", "me"]);
-    const extractedTags = Array.from(lastUserPrompt.matchAll(/(?<=^|\s)#([a-zA-Z0-9_-]+)/g))
-      .map(match => match[1].toLowerCase())
-      .filter(tag => !reservedTags.has(tag));
+    const extractedTags = Array.from(
+      userPrompt.matchAll(/(?<=^|\s)#([a-zA-Z0-9_-]+)/g)
+    )
+      .map((m) => m[1].toLowerCase())
+      .filter((t) => !reservedTags.has(t));
 
-    // Strip memory tags to prevent feedback loop
-    transcript = transcript.replace(/<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g, "");
     transcript = transcript.trim();
-
     if (transcript.length < 20) return;
-
-    // Hard-cap massive transcripts (e.g. agent printing full file out) to avoid bombing server
-    if (transcript.length > 50000) {
-      transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
+    if (transcript.length > 50_000) {
+      transcript = transcript.slice(0, 50_000) + "\n...[TRUNCATED]";
     }
 
-    try {
-      const banks = getRetainBanks(config, lastUserPrompt);
-      log(`agent_end: retaining to banks=${banks.join(",")} transcript_len=${transcript.length} tags=${extractedTags.join(",")}`);
+    const sessionId =
+      ctx.sessionManager?.getSessionId?.() || `pi-${Date.now()}`;
+    const banks = getRetainBanks(config, userPrompt);
 
+    log(
+      `agent_end: retaining to banks=${banks.join(",")} len=${transcript.length} tags=${extractedTags.join(",")}`
+    );
+
+    try {
       const results = await Promise.allSettled(
         banks.map(async (bank) => {
-          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${config.api_key || ""}`
-            },
-            body: JSON.stringify({
-              items: [{
+          const result = await apiPost(config, `/v1/default/banks/${encodeURIComponent(bank)}/memories`, {
+            items: [
+              {
                 content: transcript,
-                document_id: `session-${sessionId}`,
+                document_id: `pi-session-${sessionId}`,
                 update_mode: "append",
-                context: `pi coding session: ${lastUserPrompt.slice(0, 100)}`,
+                context: `pi coding session: ${userPrompt.slice(0, 100)}`,
                 timestamp: new Date().toISOString(),
-                ...(extractedTags.length > 0 && { tags: extractedTags })
-              }],
-              async: true
-            })
+                ...(extractedTags.length > 0 && { tags: extractedTags }),
+              },
+            ],
+            async: true,
           });
-          log(`agent_end: bank=${bank} retain HTTP ${res.status}`);
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!result.ok) throw new Error(`HTTP ${result.status}`);
           return bank;
         })
       );
 
       const succeededBanks = results
-        .filter(r => r.status === "fulfilled")
-        .map(r => (r as PromiseFulfilledResult<string>).value);
+        .filter((r) => r.status === "fulfilled")
+        .map((r) => (r as PromiseFulfilledResult<string>).value);
+
       const allFailed = succeededBanks.length === 0;
+
       hookStats.retain = {
         firedAt: new Date().toISOString(),
         result: allFailed ? "failed" : "ok",
-        detail: allFailed ? "all banks unreachable" : succeededBanks.join(", "),
+        detail: allFailed
+          ? "all banks unreachable"
+          : succeededBanks.join(", "),
       };
+
       if (allFailed) {
-        log("agent_end: all banks failed — sending next-turn notification");
+        log("agent_end: all banks failed");
         ctx.ui.setStatus("hindsight", "⚠ retain failed");
         pi.sendMessage(
           {
@@ -611,96 +652,308 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     }
   });
 
-  // -----------------------------------------------------------------------
-  // Commands
-  // -----------------------------------------------------------------------
-  pi.registerCommand("hindsight", {
-    description: "Show Hindsight status. Usage: /hindsight [status | stats | config]",
-    handler: async (args: any, ctx) => {
-      const config = getConfig();
-      if (!config) {
-        ctx.ui.notify("Hindsight config not found. Create ~/.hindsight/config", "error");
-        return;
-      }
+  // ── Manual Tools ───────────────────────────────────────────────────────
+  pi.registerTool({
+    name: "hindsight_recall",
+    label: "Hindsight Recall",
+    description:
+      "Recall relevant context, conventions, or past solutions from team memory. Use when the user explicitly asks to search memory.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Search query" }),
+    }),
+    async execute(_id, params) {
+      const config = loadConfig();
+      if (!config)
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Hindsight not configured. Create ~/.hindsight/claude-code.json",
+            },
+          ],
+          details: {},
+          isError: true,
+        };
 
-      const argsStr = (typeof args === "string" ? args : "").trim();
+      const banks = getRecallBanks(config);
+      try {
+        const allResults: string[] = [];
 
+        for (const bank of banks) {
+          const result = await apiPost(config, `/v1/default/banks/${encodeURIComponent(bank)}/memories/recall`, {
+            query: params.query,
+            budget: config.recall_budget,
+            max_tokens: config.recall_max_tokens,
+            query_timestamp: new Date().toISOString(),
+            types: config.recall_types,
+          });
 
-      if (argsStr === "status") {
-        const lines: string[] = [];
-        let hasError = false;
-
-        // Config
-        lines.push(`URL:    ${config.api_url || "Not set"}`);
-        if (!config.api_url) { lines.push("  ✗ api_url missing"); hasError = true; }
-        if (!config.api_key) { lines.push("  ⚠ api_key not set"); }
-
-        // Server health
-        const health = await getServerHealth(config);
-        lines.push(`Server: ${health.ok ? "✓ online" : `✗ unreachable${health.status ? ` (HTTP ${health.status})` : ""}`}`);
-        if (!health.ok) hasError = true;
-
-        // Project bank: auth + mission
-        const bank = getProjectBank();
-        lines.push(`Bank:   ${bank}`);
-        const bankCheck = await checkBankConfig(config, bank);
-        if (!bankCheck.ok) {
-          lines.push(`  ✗ ${bankCheck.authError ? "auth invalid — check api_key" : "bank unreachable"}`);
-          hasError = true;
-        } else {
-          lines.push(`  ✓ auth ok`);
+          if (result.ok) {
+            const results = (result.data as any).results || [];
+            for (const r of results) {
+              allResults.push(`[${bank}] ${r.text}`);
+            }
+          }
         }
 
-        if (config.global_bank) lines.push(`Global: ${config.global_bank}`);
-        // Hook state
-        lines.push("");
-        lines.push("Hooks this session:");
-        const hookIcon = (r?: string) => r === "ok" ? "✓" : r === "failed" ? "✗" : r === "skipped" ? "−" : "…";
-        const fmtHook = (h: HookRecord) =>
-          h.firedAt ? `${hookIcon(h.result)} ${h.result}${h.detail ? ` (${h.detail})` : ""}` : "not fired";
-        lines.push(`  session_start:      ${fmtHook(hookStats.sessionStart)}`);
-        lines.push(`  recall:             ${fmtHook(hookStats.recall)}`);
-        lines.push(`  retain:             ${fmtHook(hookStats.retain)}`);
-
-        // Debug log
-        lines.push("");
-        if (DEBUG) {
-          const logLines = readRecentLogErrors(10);
-          lines.push(`Debug log (last ${logLines.length} lines):`);
-          logLines.forEach(l => lines.push(`  ${l}`));
-        } else {
-          lines.push("Debug log: disabled (set HINDSIGHT_DEBUG=1 to enable)");
+        if (allResults.length > 0) {
+          return {
+            content: [
+              { type: "text" as const, text: allResults.join("\n\n") },
+            ],
+            details: { count: allResults.length },
+          };
         }
-        ctx.ui.notify(lines.join("\n"), hasError ? "error" : "info");
-        return;
+        return {
+          content: [{ type: "text" as const, text: "No memories found." }],
+          details: {},
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e}` }],
+          details: {},
+          isError: true,
+        };
       }
+    },
+  });
 
-      if (argsStr === "stats") {
-        const banks = getRecallBanks(config);
-        const allStats = await Promise.all(
-          banks.map(async (bank) => {
-            const stats = await getBankStats(config, bank);
-            return { bank, stats };
-          })
-        );
-        const lines = allStats.map(({ bank, stats }) => {
-          if (!stats) return `${bank}: unavailable`;
-          const entries = Object.entries(stats)
-            .map(([k, v]) => `  ${k}: ${v}`)
-            .join("\n");
-          return `${bank}:\n${entries}`;
+  pi.registerTool({
+    name: "hindsight_retain",
+    label: "Hindsight Retain",
+    description:
+      "Force-save an explicit insight to memory. Only use when explicitly requested.",
+    parameters: Type.Object({
+      content: Type.String({ description: "The rich context to save" }),
+      tags: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Optional tags for categorization",
+        })
+      ),
+    }),
+    async execute(_id, params) {
+      const config = loadConfig();
+      if (!config)
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Hindsight not configured. Create ~/.hindsight/claude-code.json",
+            },
+          ],
+          details: {},
+          isError: true,
+        };
+
+      const bank = getPrimaryBank(config);
+      try {
+        const result = await apiPost(config, `/v1/default/banks/${encodeURIComponent(bank)}/memories`, {
+          items: [
+            {
+              content: params.content,
+              context: "pi: explicit user save",
+              timestamp: new Date().toISOString(),
+              ...(params.tags && params.tags.length > 0
+                ? { tags: params.tags }
+                : {}),
+            },
+          ],
+          async: true,
         });
+
+        if (result.ok) {
+          log(`hindsight_retain: saved to bank=${bank}`);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Memory retained to bank "${bank}".`,
+              },
+            ],
+            details: { bank },
+          };
+        }
+        return {
+          content: [
+            { type: "text" as const, text: `Failed to retain (HTTP ${result.status}).` },
+          ],
+          details: {},
+          isError: true,
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e}` }],
+          details: {},
+          isError: true,
+        };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "hindsight_reflect",
+    label: "Hindsight Reflect",
+    description:
+      "Synthesize context from memory to answer a question. Use when the user wants a summary or analysis of stored knowledge.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Question to reflect on" }),
+    }),
+    async execute(_id, params) {
+      const config = loadConfig();
+      if (!config)
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Hindsight not configured. Create ~/.hindsight/claude-code.json",
+            },
+          ],
+          details: {},
+          isError: true,
+        };
+
+      const bank = getPrimaryBank(config);
+      try {
+        const result = await apiPost(config, `/v1/default/banks/${encodeURIComponent(bank)}/memories/reflect`, {
+          query: params.query,
+        });
+
+        if (result.ok) {
+          const data = result.data as any;
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: data.synthesis || data.answer || JSON.stringify(data),
+              },
+            ],
+            details: {},
+          };
+        }
+        return {
+          content: [
+            { type: "text" as const, text: `Failed to reflect (HTTP ${result.status}).` },
+          ],
+          details: {},
+          isError: true,
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${e}` }],
+          details: {},
+          isError: true,
+        };
+      }
+    },
+  });
+
+  // ── Commands ───────────────────────────────────────────────────────────
+  pi.registerCommand("hindsight", {
+    description: "Hindsight memory status. Usage: /hindsight [status | stats]",
+    handler: async (args, ctx) => {
+      const config = loadConfig();
+      if (!config) {
+        ctx.ui.notify(
+          "Hindsight not configured. Create ~/.hindsight/claude-code.json with hindsightApiUrl and hindsightApiToken.",
+          "error"
+        );
+        return;
+      }
+
+      const sub = (typeof args === "string" ? args : "").trim();
+
+      if (sub === "stats") {
+        const banks = getRecallBanks(config);
+        const lines: string[] = [];
+
+        for (const bank of banks) {
+          const result = await apiGet(config, `/v1/default/banks/${encodeURIComponent(bank)}/stats`);
+          if (result.ok) {
+            const stats = result.data as Record<string, number>;
+            const entries = Object.entries(stats)
+              .map(([k, v]) => `  ${k}: ${v}`)
+              .join("\n");
+            lines.push(`${bank}:\n${entries}`);
+          } else {
+            lines.push(`${bank}: unavailable (HTTP ${result.status})`);
+          }
+        }
+
         ctx.ui.notify(lines.join("\n\n"), "info");
         return;
       }
-      const status = [
-        `URL: ${config.api_url || "Not set"}`,
-        `Global Bank: ${config.global_bank || "Not set"}`,
-        `Project Bank (Recall & Default Retain): ${getProjectBank()}`,
-        `Active Recall Banks: ${getRecallBanks(config).join(", ")}`,
-        `Commands: /hindsight status | stats | mission [text]`,
-      ].join("\n");
-      ctx.ui.notify(status, "info");
+
+      // Default + status: full health check
+      const lines: string[] = [];
+      let hasError = false;
+
+      // Config
+      lines.push(`URL:    ${config.api_url}`);
+      if (!config.api_key) {
+        lines.push("  ⚠ api_key not set");
+      }
+
+      // Primary bank
+      const primaryBank = getPrimaryBank(config);
+      lines.push(`Bank:   ${primaryBank}${config.bank_id ? " (configured)" : " (auto-derived)"}`);
+
+      // Health
+      const health = await apiGet(config, "/health");
+      if (!health.ok) {
+        lines.push(`Server: ✗ unreachable${health.status ? ` (HTTP ${health.status})` : ""}`);
+        hasError = true;
+      } else {
+        lines.push("Server: ✓ online");
+      }
+
+      // Auth check via bank profile
+      const profile = await apiGet(config, `/v1/default/banks/${encodeURIComponent(primaryBank)}/profile`);
+      if (!profile.ok) {
+        if (profile.status === 401 || profile.status === 403) {
+          lines.push("  ✗ auth invalid — check api_key");
+          hasError = true;
+        } else if (profile.status === 404) {
+          lines.push("  ⚠ bank not found yet (will be created on first retain)");
+        } else {
+          lines.push(`  ⚠ could not verify (HTTP ${profile.status})`);
+        }
+      } else {
+        lines.push("  ✓ auth ok");
+      }
+
+      if (config.global_bank) {
+        lines.push(`Global: ${config.global_bank}`);
+      }
+
+      // Recall config
+      lines.push("");
+      lines.push(`Recall: types=${config.recall_types.join(",")} budget=${config.recall_budget} maxTokens=${config.recall_max_tokens}`);
+      lines.push(`Retain: every ${config.retain_every_n_turns} turn(s)`);
+
+      // Hook state
+      lines.push("");
+      lines.push("Hooks this session:");
+      const hookIcon = (r?: string) =>
+        r === "ok" ? "✓" : r === "failed" ? "✗" : r === "skipped" ? "−" : "…";
+      const fmtHook = (h: HookRecord) =>
+        h.firedAt
+          ? `${hookIcon(h.result)} ${h.result}${h.detail ? ` (${h.detail})` : ""}`
+          : "not fired";
+      lines.push(`  session_start: ${fmtHook(hookStats.sessionStart)}`);
+      lines.push(`  recall:        ${fmtHook(hookStats.recall)}`);
+      lines.push(`  retain:        ${fmtHook(hookStats.retain)}`);
+
+      // Debug
+      lines.push("");
+      if (DEBUG) {
+        const logLines = readRecentLogLines(10);
+        lines.push(`Debug log (last ${logLines.length} lines):`);
+        logLines.forEach((l) => lines.push(`  ${l}`));
+      } else {
+        lines.push("Debug: disabled (set HINDSIGHT_DEBUG=1)");
+      }
+
+      ctx.ui.notify(lines.join("\n"), hasError ? "error" : "info");
     },
   });
 }
