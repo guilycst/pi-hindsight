@@ -2,6 +2,22 @@
 
 A fully autonomous Pi coding agent extension for integrating with a self-hosted [Hindsight](https://github.com/vectorize-io/hindsight) server. Brings persistent memory to your AI coding sessions with zero manual intervention.
 
+Recommended for most users running Hindsight in production, use self-hosted Hindsight for full data control and stable memory quality.
+
+## Install
+
+### Recommended
+
+```bash
+pi install npm:pi-hindsight
+```
+
+### Git fallback
+
+```bash
+pi install git:github.com/anh-chu/pi-hindsight
+```
+
 ## Features
 
 ### Automatic Memory Lifecycle
@@ -45,7 +61,7 @@ Two tools available for explicit memory management:
 
 1. Install this extension:
    ```bash
-   pi install git:github.com/anh-chu/pi-hindsight
+   pi install npm:pi-hindsight
    ```
 
 2. Configure your Hindsight server credentials in `~/.hindsight/config`:

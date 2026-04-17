@@ -1,20 +1,48 @@
 {
-  "name": "hindsight-selfhosted",
+  "name": "pi-hindsight",
   "version": "1.0.0",
-  "description": "",
+  "description": "Hindsight self-hosted memory extension for Pi",
+  "type": "module",
   "main": "index.js",
+  "license": "ISC",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "hindsight",
+    "memory"
+  ],
+  "files": [
+    "index.js",
+    "index.ts",
+    "skills",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
   "pi": {
-    "extensions": ["./index.ts"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "scripts": {
     "test": "node --experimental-strip-types test.ts",
-    "build": "tsc index.ts"
+    "build": "tsc index.ts",
+    "check": "npm run build"
   },
-  "keywords": [],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anh-chu/pi-hindsight.git"
+  },
+  "homepage": "https://github.com/anh-chu/pi-hindsight#readme",
+  "bugs": {
+    "url": "https://github.com/anh-chu/pi-hindsight/issues"
+  },
   "author": "",
-  "license": "ISC",
-  "type": "module",
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
