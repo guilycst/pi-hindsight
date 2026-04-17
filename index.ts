@@ -1,9 +1,8 @@
 /**
  * Hindsight Self-Hosted Extension for Pi
  *
- * Fully autonomous memory via lifecycle hooks. Adapted for the TKS monorepo
- * Hindsight deployment — reads from the same ~/.hindsight/claude-code.json
- * config used by the Claude Code plugin, with env var overrides.
+ * Fully autonomous memory via lifecycle hooks.
+ * Config: ~/.hindsight/config (key=value) with env var overrides.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -37,13 +36,13 @@ function log(msg: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Config — reads the same JSON config as the Claude Code plugin
+// Config — ~/.hindsight/config (key=value) with env var overrides
 // ---------------------------------------------------------------------------
 
 interface HindsightConfig {
   api_url: string;
   api_key: string;
-  /** Explicit bank ID from config (e.g. "totvs-work"). Overrides project-based derivation. */
+  /** Explicit bank ID from config. Overrides project-based derivation. */
   bank_id?: string;
   /** Optional global/cross-project bank */
   global_bank?: string;
@@ -59,6 +58,7 @@ interface HindsightConfig {
 const CONFIG_DEFAULTS: Omit<HindsightConfig, "api_url" | "api_key"> = {
   bank_id: undefined,
   global_bank: undefined,
+  // Match the other agent plugin defaults for consistent experience
   recall_types: ["world", "experience"],
   recall_budget: "mid",
   recall_max_tokens: 1024,
@@ -68,49 +68,64 @@ const CONFIG_DEFAULTS: Omit<HindsightConfig, "api_url" | "api_key"> = {
   auto_retain: true,
 };
 
+/** Parse key=value config file (handles quotes and bare values). */
+function parseConfigFile(filePath: string): Record<string, string> {
+  try {
+    if (!existsSync(filePath)) return {};
+    const raw = readFileSync(filePath, "utf-8");
+    const config: Record<string, string> = {};
+    for (const line of raw.split("\n")) {
+      const match = line.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*["']?(.*?)["']?\s*$/);
+      if (match) config[match[1]] = match[2];
+    }
+    return config;
+  } catch {
+    return {};
+  }
+}
+
 /**
- * Load config from ~/.hindsight/claude-code.json (same as Claude Code plugin)
- * with env var overrides.
+ * Load config from ~/.hindsight/config (key=value format).
+ * Supports project-level override via .hindsight/config in CWD.
+ * Env vars take final precedence.
  */
 function loadConfig(): HindsightConfig | null {
-  const configPath = join(homedir(), ".hindsight", "claude-code.json");
-  if (!existsSync(configPath)) {
-    log(`config: ${configPath} not found`);
+  const globalCfg = parseConfigFile(join(homedir(), ".hindsight", "config"));
+  const localCfg = parseConfigFile(join(process.cwd(), ".hindsight", "config"));
+  const merged = { ...globalCfg, ...localCfg };
+
+  const api_url = process.env.HINDSIGHT_API_URL || merged.api_url || "";
+  const api_key = process.env.HINDSIGHT_API_TOKEN || merged.api_key || "";
+
+  if (!api_url) {
+    log("config: no api_url configured");
     return null;
   }
 
-  try {
-    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-    const api_url =
-      process.env.HINDSIGHT_API_URL || raw.hindsightApiUrl || "";
-    const api_key =
-      process.env.HINDSIGHT_API_TOKEN || raw.hindsightApiToken || "";
+  const recallTypesRaw = merged.recall_types;
+  const recall_types = recallTypesRaw
+    ? recallTypesRaw.split(",").map((t) => t.trim()).filter(Boolean)
+    : CONFIG_DEFAULTS.recall_types;
 
-    if (!api_url) {
-      log("config: no api_url configured");
-      return null;
-    }
-
-    return {
-      api_url: api_url.replace(/\/$/, ""),
-      api_key,
-      bank_id: raw.bankId || raw.bank_id,
-      global_bank: raw.globalBank || raw.global_bank,
-      recall_types: raw.recallTypes || CONFIG_DEFAULTS.recall_types,
-      recall_budget: raw.recallBudget || CONFIG_DEFAULTS.recall_budget,
-      recall_max_tokens:
-        raw.recallMaxTokens || CONFIG_DEFAULTS.recall_max_tokens,
-      recall_max_query_chars:
-        raw.recallMaxQueryChars || CONFIG_DEFAULTS.recall_max_query_chars,
-      retain_every_n_turns:
-        raw.retainEveryNTurns || CONFIG_DEFAULTS.retain_every_n_turns,
-      auto_recall: raw.autoRecall !== false,
-      auto_retain: raw.autoRetain !== false,
-    };
-  } catch (e) {
-    log(`config: failed to parse ${configPath}: ${e}`);
-    return null;
-  }
+  return {
+    api_url: api_url.replace(/\/$/, ""),
+    api_key,
+    bank_id: merged.bank_id,
+    global_bank: merged.global_bank,
+    recall_types,
+    recall_budget: merged.recall_budget || CONFIG_DEFAULTS.recall_budget,
+    recall_max_tokens: merged.recall_max_tokens
+      ? parseInt(merged.recall_max_tokens, 10)
+      : CONFIG_DEFAULTS.recall_max_tokens,
+    recall_max_query_chars: merged.recall_max_query_chars
+      ? parseInt(merged.recall_max_query_chars, 10)
+      : CONFIG_DEFAULTS.recall_max_query_chars,
+    retain_every_n_turns: merged.retain_every_n_turns
+      ? parseInt(merged.retain_every_n_turns, 10)
+      : CONFIG_DEFAULTS.retain_every_n_turns,
+    auto_recall: merged.auto_recall !== "false",
+    auto_retain: merged.auto_retain !== "false",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +683,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: "Hindsight not configured. Create ~/.hindsight/claude-code.json",
+              text: "Hindsight not configured. Create ~/.hindsight/config",
             },
           ],
           details: {},
@@ -738,7 +753,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: "Hindsight not configured. Create ~/.hindsight/claude-code.json",
+              text: "Hindsight not configured. Create ~/.hindsight/config",
             },
           ],
           details: {},
@@ -805,7 +820,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: "Hindsight not configured. Create ~/.hindsight/claude-code.json",
+              text: "Hindsight not configured. Create ~/.hindsight/config",
             },
           ],
           details: {},
@@ -854,7 +869,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const config = loadConfig();
       if (!config) {
         ctx.ui.notify(
-          "Hindsight not configured. Create ~/.hindsight/claude-code.json with hindsightApiUrl and hindsightApiToken.",
+          "Hindsight not configured. Create ~/.hindsight/config with hindsightApiUrl and hindsightApiToken.",
           "error"
         );
         return;

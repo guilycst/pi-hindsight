@@ -22,7 +22,22 @@ import { homedir } from "node:os";
 // Config + API helpers (inlined from extension)
 // ---------------------------------------------------------------------------
 
-const CONFIG_PATH = join(homedir(), ".hindsight", "claude-code.json");
+const CONFIG_PATH = join(homedir(), ".hindsight", "config");
+
+function parseConfigFile(filePath: string): Record<string, string> {
+  try {
+    if (!existsSync(filePath)) return {};
+    const raw = readFileSync(filePath, "utf-8");
+    const config: Record<string, string> = {};
+    for (const line of raw.split("\n")) {
+      const match = line.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*["']?(.*?)["']?\s*$/);
+      if (match) config[match[1]] = match[2];
+    }
+    return config;
+  } catch {
+    return {};
+  }
+}
 
 interface Config {
   api_url: string;
@@ -38,27 +53,28 @@ interface Config {
 }
 
 function loadConfig(): Config | null {
-  if (!existsSync(CONFIG_PATH)) return null;
-  try {
-    const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-    const api_url = process.env.HINDSIGHT_API_URL || raw.hindsightApiUrl || "";
-    const api_key = process.env.HINDSIGHT_API_TOKEN || raw.hindsightApiToken || "";
-    if (!api_url) return null;
-    return {
-      api_url: api_url.replace(/\/$/, ""),
-      api_key,
-      bank_id: raw.bankId || raw.bank_id,
-      global_bank: raw.globalBank || raw.global_bank,
-      recall_types: raw.recallTypes || ["world", "experience"],
-      recall_budget: raw.recallBudget || "mid",
-      recall_max_tokens: raw.recallMaxTokens || 1024,
-      retain_every_n_turns: raw.retainEveryNTurns || 1,
-      auto_recall: raw.autoRecall !== false,
-      auto_retain: raw.autoRetain !== false,
-    };
-  } catch {
-    return null;
-  }
+  const merged = parseConfigFile(CONFIG_PATH);
+  const api_url = process.env.HINDSIGHT_API_URL || merged.api_url || "";
+  const api_key = process.env.HINDSIGHT_API_TOKEN || merged.api_key || "";
+  if (!api_url) return null;
+
+  const recallTypesRaw = merged.recall_types;
+  const recall_types = recallTypesRaw
+    ? recallTypesRaw.split(",").map(t => t.trim()).filter(Boolean)
+    : ["world", "experience"];
+
+  return {
+    api_url: api_url.replace(/\/$/, ""),
+    api_key,
+    bank_id: merged.bank_id,
+    global_bank: merged.global_bank,
+    recall_types,
+    recall_budget: merged.recall_budget || "mid",
+    recall_max_tokens: merged.recall_max_tokens ? parseInt(merged.recall_max_tokens, 10) : 1024,
+    retain_every_n_turns: merged.retain_every_n_turns ? parseInt(merged.retain_every_n_turns, 10) : 1,
+    auto_recall: merged.auto_recall !== "false",
+    auto_retain: merged.auto_retain !== "false",
+  };
 }
 
 function getPrimaryBank(c: Config): string {
@@ -132,7 +148,7 @@ async function main() {
   console.log("\n1. Config loading");
   const config = loadConfig();
 
-  await test("loads ~/.hindsight/claude-code.json", async () => {
+  await test("loads ~/.hindsight/config", async () => {
     assert.ok(config, "Config should load");
     assert.ok(config!.api_url, "api_url required");
     assert.ok(config!.api_key, "api_key required");
